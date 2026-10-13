@@ -1,0 +1,77 @@
+name: Unzip VEDA VPN and Build APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP="VEDA_VPN_Android_GitHub_Build.zip"
+
+          if [ ! -f "$ZIP" ]; then
+            echo "::error::ZIP file not found: $ZIP"
+            ls -la
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/veda"
+          unzip -oq "$ZIP" -d "$RUNNER_TEMP/veda"
+
+          SETTINGS="$(find "$RUNNER_TEMP/veda" -type f -name 'settings.gradle.kts' -print -quit)"
+
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::settings.gradle.kts not found in ZIP"
+            find "$RUNNER_TEMP/veda" -maxdepth 5 -type f
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare Android SDK (preinstalled on runner)
+        shell: bash
+        run: |
+          SDKM="$(command -v sdkmanager || true)"
+          if [ -z "$SDKM" ]; then
+            SDKM="$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f | head -n 1)"
+          fi
+          echo "Using: $SDKM"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-36" "build-tools;36.0.0" "build-tools;35.0.0" || true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+
+      - name: Build APK
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle --no-daemon assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: VEDA-VPN-debug-APK
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
