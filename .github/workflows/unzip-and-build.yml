@@ -1,3 +1,4 @@
+
 name: Unzip VEDA VPN and Build APK
 
 on:
@@ -23,6 +24,7 @@ jobs:
 
           if [ ! -f "$ZIP" ]; then
             echo "::error::ZIP file not found: $ZIP"
+            echo "Upload the ZIP to the repository root."
             ls -la
             exit 1
           fi
@@ -35,7 +37,7 @@ jobs:
 
           if [ -z "$SETTINGS" ]; then
             echo "::error::Android project not found inside ZIP"
-            find "$RUNNER_TEMP/veda" -maxdepth 4 -type f
+            find "$RUNNER_TEMP/veda" -maxdepth 5 -type f
             exit 1
           fi
 
@@ -46,23 +48,31 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+          cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK
-        run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.13"
 
-      - name: Build APK
+      - name: Build debug APK
         working-directory: ${{ env.PROJECT_DIR }}
         run: gradle --no-daemon assembleDebug
 
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: VEDA-VPN-debug-APK
