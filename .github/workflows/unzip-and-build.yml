@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -14,41 +14,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Unzip VEDA VPN ZIP
+      - name: Extract ZIP
         run: |
           set -e
-          ZIP="VEDA_VPN_Android_GitHub_Build.zip"
-
-          if [ ! -f "$ZIP" ]; then
-            echo "ERROR: ZIP file not found: $ZIP"
-            ls -la
-            exit 1
-          fi
-
           mkdir -p /tmp/veda
-          unzip -oq "$ZIP" -d /tmp/veda
+          unzip -oq VEDA_VPN_Android_GitHub_Build.zip -d /tmp/veda
 
-          SETTINGS=$(find /tmp/veda -name settings.gradle.kts -print -quit)
-
-          if [ -z "$SETTINGS" ]; then
-            echo "ERROR: Android project not found inside ZIP"
-            find /tmp/veda -maxdepth 4 -type f
+          PROJECT=$(find /tmp/veda -name settings.gradle.kts -print -quit)
+          if [ -z "$PROJECT" ]; then
+            echo "Android project not found in ZIP"
             exit 1
           fi
 
-          SRC="$(dirname "$SETTINGS")"
-          cp -a "$SRC"/. .
-
-          rm -f "$ZIP"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-
-          if ! git diff --cached --quiet; then
-            git commit -m "Extract VEDA VPN Android project"
-            git push
-          fi
+          echo "PROJECT_DIR=$(dirname "$PROJECT")" >> "$GITHUB_ENV"
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -68,17 +46,12 @@ jobs:
           gradle-version: "8.13"
 
       - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
         run: gradle --no-daemon assembleDebug
 
       - name: Upload APK
-
-
         uses: actions/upload-artifact@v4
         with:
-        
           name: VEDA-VPN-debug-APK
-          path: app/build/outputs/apk/debug/*.apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
-          retention-days: 14
-
-
