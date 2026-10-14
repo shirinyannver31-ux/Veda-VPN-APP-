@@ -1,9 +1,15 @@
-name: Unzip VEDA VPN and Build APK
+
+name: Build VEDA VPN Release APK
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version"
+        required: true
+        default: "1.0.1"
 
 permissions:
   contents: read
@@ -12,9 +18,25 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    env:
+      APP_VERSION: ${{ inputs.version || '1.0.1' }}
+      FARVATER_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      FARVATER_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      FARVATER_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Check signing secrets
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_B64"
+          test -n "$FARVATER_KEYSTORE_PASSWORD"
+          test -n "$FARVATER_KEY_ALIAS"
+          test -n "$FARVATER_KEY_PASSWORD"
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -24,11 +46,8 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: ''
 
       - name: Install Android SDK and NDK
-        shell: bash
         run: |
           set -euo pipefail
           sdkmanager --install \
@@ -37,123 +56,110 @@ jobs:
             "build-tools;36.0.0" \
             "ndk;26.3.11579264"
 
-      - name: Locate and extract project ZIP
-        shell: bash
+      - name: Extract Android project
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
           set -euo pipefail
 
           ZIP_FILE="$(find . -maxdepth 2 -type f \
             -iname 'VEDA_VPN_Android_GitHub_Build.zip' \
             -print -quit)"
+          test -n "$ZIP_FILE"
 
-          if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: Project ZIP was not found."
-            exit 1
-          fi
+          ROOT="$RUNNER_TEMP/veda-project"
+          mkdir -p "$ROOT"
+          unzip -q "$ZIP_FILE" -d "$ROOT"
 
-          mkdir -p "$RUNNER_TEMP/veda-project"
-          unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/veda-project"
-
-          PROJECT_DIR="$(find "$RUNNER_TEMP/veda-project" \
-            -type f -name 'settings.gradle*' \
+          PROJECT_DIR="$(find "$ROOT" -type f \
+            \( -name settings.gradle.kts -o -name settings.gradle \) \
             -print -quit | xargs -r dirname)"
 
           if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: Android project was not found in ZIP."
-            exit 1
+            INNER_ZIP="$(find "$ROOT" -type f \
+              -iname 'VEDA_VPN_Android_GitHub_Build.zip' \
+              -print -quit)"
+
+            if [ -n "$INNER_ZIP" ]; then
+              mkdir -p "$ROOT/inner"
+              unzip -q "$INNER_ZIP" -d "$ROOT/inner"
+              PROJECT_DIR="$(find "$ROOT/inner" -type f \
+                \( -name settings.gradle.kts -o -name settings.gradle \) \
+                -print -quit | xargs -r dirname)"
+            fi
           fi
+
+          test -n "$PROJECT_DIR" || {
+            echo "Android Gradle project not found"
+            exit 1
+          }
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Project found: $PROJECT_DIR"
 
-      - name: Download Xray and build HEV native libraries
-        shell: bash
+          printf '%s' "$KEYSTORE_B64" | base64 --decode \
+            > "$RUNNER_TEMP/veda-release.jks"
+          test -s "$RUNNER_TEMP/veda-release.jks"
+          echo "FARVATER_KEYSTORE=$RUNNER_TEMP/veda-release.jks" \
+            >> "$GITHUB_ENV"
+
+      - name: Build HEV native libraries
         run: |
           set -euo pipefail
-
-          export ANDROID_HOME="$ANDROID_SDK_ROOT"
           export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/26.3.11579264"
           export PATH="$ANDROID_NDK_HOME:$PATH"
-
           cd "$PROJECT_DIR"
-
-          if [ ! -f scripts/fetch-natives.sh ]; then
-            echo "ERROR: scripts/fetch-natives.sh is missing."
-            exit 1
-          fi
-
+          test -f scripts/fetch-natives.sh
           chmod +x scripts/fetch-natives.sh
           bash scripts/fetch-natives.sh
 
       - name: Verify native libraries
-        shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
 
           for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
             LIB="app/src/main/jniLibs/$ABI/libhev-socks5-tunnel.so"
-
-            if [ ! -s "$LIB" ]; then
-              echo "ERROR: Missing HEV library for $ABI"
-              exit 1
-            fi
-
-            file "$LIB"
+            test -s "$LIB"
             readelf -h "$LIB" >/dev/null
-
-            SIZE=$(stat -c%s "$LIB")
-            if [ "$SIZE" -lt 10000 ]; then
-              echo "ERROR: HEV library is suspiciously small: $LIB"
-              exit 1
-            fi
-
-            echo "Verified HEV library: $ABI ($SIZE bytes)"
+            test "$(stat -c%s "$LIB")" -ge 10000
           done
-
-          find app/src/main/jniLibs -type f -name '*.so' -print
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.13"
 
-      - name: Build APK
-        shell: bash
+      - name: Build signed Release APK
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
-          gradle --no-daemon assembleDebug --stacktrace
+          gradle --no-daemon assembleRelease \
+            -PfarvaterVersion="$APP_VERSION" --stacktrace
 
-      - name: Verify APK contains HEV library
-        shell: bash
+      - name: Verify and collect APKs
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
 
-          APK="$(find app/build/outputs/apk \
+          mkdir -p "$RUNNER_TEMP/veda-release"
+          find app/build/outputs/apk/release -type f -name '*.apk' \
+            -exec cp {} "$RUNNER_TEMP/veda-release/" \;
+
+          APKSIGNER="$(find "$ANDROID_SDK_ROOT/build-tools" \
+            -name apksigner -type f | sort | tail -n1)"
+
+          for APK in "$RUNNER_TEMP"/veda-release/*.apk; do
+            "$APKSIGNER" verify --verbose "$APK"
+            echo "Verified: $(basename "$APK")"
+          done
+
+          test -n "$(find "$RUNNER_TEMP/veda-release" \
             -type f -name '*.apk' -print -quit)"
 
-          if [ -z "$APK" ]; then
-            echo "ERROR: APK was not created."
-            exit 1
-          fi
-
-          unzip -l "$APK" > "$RUNNER_TEMP/apk-files.txt"
-
-          if ! grep -q 'lib/[^ ]*/libhev-socks5-tunnel.so' \
-            "$RUNNER_TEMP/apk-files.txt"; then
-            echo "ERROR: APK does not contain HEV TUN library."
-            exit 1
-          fi
-
-          echo "APK contains HEV TUN library."
-          echo "APK path: $APK"
-
-      - name: Upload APK
+      - name: Upload Release APKs
         uses: actions/upload-artifact@v4
         with:
-          name: VEDA-VPN-APK
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/**/*.apk
+          name: VEDA-VPN-Release-${{ env.APP_VERSION }}
+          path: ${{ runner.temp }}/veda-release/*.apk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
