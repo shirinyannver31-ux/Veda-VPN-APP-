@@ -24,10 +24,15 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ''
 
       - name: Install Android SDK and NDK
+        shell: bash
         run: |
-          sdkmanager "platform-tools" \
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0" \
             "ndk;26.3.11579264"
@@ -96,8 +101,8 @@ jobs:
 
             file "$LIB"
             readelf -h "$LIB" >/dev/null
-            SIZE=$(stat -c%s "$LIB")
 
+            SIZE=$(stat -c%s "$LIB")
             if [ "$SIZE" -lt 10000 ]; then
               echo "ERROR: HEV library is suspiciously small: $LIB"
               exit 1
@@ -120,7 +125,7 @@ jobs:
           cd "$PROJECT_DIR"
           gradle --no-daemon assembleDebug --stacktrace
 
-      - name: Verify APK contains native libraries
+      - name: Verify APK contains HEV library
         shell: bash
         run: |
           set -euo pipefail
