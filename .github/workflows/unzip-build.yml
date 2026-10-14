@@ -28,16 +28,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check signing secrets
-        env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        run: |
-          set -euo pipefail
-          test -n "$KEYSTORE_B64"
-          test -n "$FARVATER_KEYSTORE_PASSWORD"
-          test -n "$FARVATER_KEY_ALIAS"
-          test -n "$FARVATER_KEY_PASSWORD"
-
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -46,8 +36,11 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ''
 
       - name: Install Android SDK and NDK
+        shell: bash
         run: |
           set -euo pipefail
           sdkmanager --install \
@@ -56,72 +49,120 @@ jobs:
             "build-tools;36.0.0" \
             "ndk;26.3.11579264"
 
-      - name: Extract Android project
+      - name: Validate signing secrets
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_B64" || {
+            echo "Missing ANDROID_KEYSTORE_BASE64"
+            exit 1
+          }
+          test -n "$FARVATER_KEYSTORE_PASSWORD"
+          test -n "$FARVATER_KEY_ALIAS"
+          test -n "$FARVATER_KEY_PASSWORD"
+
+      - name: Extract Android project
+        shell: bash
         run: |
           set -euo pipefail
 
           ZIP_FILE="$(find . -maxdepth 2 -type f \
-            -iname 'VEDA_VPN_Android_GitHub_Build.zip' \
+            -name 'VEDA_VPN_Android_GitHub_Build.zip' \
             -print -quit)"
-          test -n "$ZIP_FILE"
+
+          test -n "$ZIP_FILE" || {
+            echo "Project ZIP not found"
+            exit 1
+          }
 
           ROOT="$RUNNER_TEMP/veda-project"
           mkdir -p "$ROOT"
           unzip -q "$ZIP_FILE" -d "$ROOT"
 
           PROJECT_DIR="$(find "$ROOT" -type f \
-            \( -name settings.gradle.kts -o -name settings.gradle \) \
+            \( -name 'settings.gradle.kts' \
+            -o -name 'settings.gradle' \) \
             -print -quit | xargs -r dirname)"
 
           if [ -z "$PROJECT_DIR" ]; then
             INNER_ZIP="$(find "$ROOT" -type f \
-              -iname 'VEDA_VPN_Android_GitHub_Build.zip' \
+              -name 'VEDA_VPN_Android_GitHub_Build.zip' \
               -print -quit)"
 
             if [ -n "$INNER_ZIP" ]; then
               mkdir -p "$ROOT/inner"
               unzip -q "$INNER_ZIP" -d "$ROOT/inner"
+
               PROJECT_DIR="$(find "$ROOT/inner" -type f \
-                \( -name settings.gradle.kts -o -name settings.gradle \) \
+                \( -name 'settings.gradle.kts' \
+                -o -name 'settings.gradle' \) \
                 -print -quit | xargs -r dirname)"
             fi
           fi
 
           test -n "$PROJECT_DIR" || {
-            echo "Android Gradle project not found"
+            echo "Android Gradle project not found in ZIP"
             exit 1
           }
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Android project found"
 
-          printf '%s' "$KEYSTORE_B64" | base64 --decode \
+      - name: Configure signing keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          printf '%s' "$KEYSTORE_B64" \
+            | base64 --decode \
             > "$RUNNER_TEMP/veda-release.jks"
+
           test -s "$RUNNER_TEMP/veda-release.jks"
+
           echo "FARVATER_KEYSTORE=$RUNNER_TEMP/veda-release.jks" \
             >> "$GITHUB_ENV"
 
       - name: Build HEV native libraries
+        shell: bash
         run: |
           set -euo pipefail
+
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
           export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/26.3.11579264"
           export PATH="$ANDROID_NDK_HOME:$PATH"
+
           cd "$PROJECT_DIR"
-          test -f scripts/fetch-natives.sh
+
+          test -f scripts/fetch-natives.sh || {
+            echo "scripts/fetch-natives.sh is missing"
+            exit 1
+          }
+
           chmod +x scripts/fetch-natives.sh
           bash scripts/fetch-natives.sh
 
       - name: Verify native libraries
+        shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
 
           for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
             LIB="app/src/main/jniLibs/$ABI/libhev-socks5-tunnel.so"
-            test -s "$LIB"
+
+            test -s "$LIB" || {
+              echo "Missing HEV library: $ABI"
+              exit 1
+            }
+
             readelf -h "$LIB" >/dev/null
-            test "$(stat -c%s "$LIB")" -ge 10000
+
+            SIZE="$(stat -c%s "$LIB")"
+            test "$SIZE" -ge 10000
           done
 
       - name: Set up Gradle
@@ -130,23 +171,29 @@ jobs:
           gradle-version: "8.13"
 
       - name: Build signed Release APK
+        shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
-          gradle --no-daemon assembleRelease \
-            -PfarvaterVersion="$APP_VERSION" --stacktrace
 
-      - name: Verify and collect APKs
+          gradle --no-daemon assembleRelease \
+            -PfarvaterVersion="$APP_VERSION" \
+            --stacktrace
+
+      - name: Verify APKs
+        shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
 
           mkdir -p "$RUNNER_TEMP/veda-release"
-          find app/build/outputs/apk/release -type f -name '*.apk' \
+
+          find app/build/outputs/apk/release \
+            -type f -name '*.apk' \
             -exec cp {} "$RUNNER_TEMP/veda-release/" \;
 
           APKSIGNER="$(find "$ANDROID_SDK_ROOT/build-tools" \
-            -name apksigner -type f | sort | tail -n1)"
+            -name apksigner -type f | sort | tail -n 1)"
 
           for APK in "$RUNNER_TEMP"/veda-release/*.apk; do
             "$APKSIGNER" verify --verbose "$APK"
