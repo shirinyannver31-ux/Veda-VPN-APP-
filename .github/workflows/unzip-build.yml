@@ -1,0 +1,154 @@
+name: Unzip VEDA VPN and Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK and NDK
+        run: |
+          sdkmanager "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;26.3.11579264"
+
+      - name: Locate and extract project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="$(find . -maxdepth 2 -type f \
+            -iname 'VEDA_VPN_Android_GitHub_Build.zip' \
+            -print -quit)"
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: Project ZIP was not found."
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/veda-project"
+          unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/veda-project"
+
+          PROJECT_DIR="$(find "$RUNNER_TEMP/veda-project" \
+            -type f -name 'settings.gradle*' \
+            -print -quit | xargs -r dirname)"
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: Android project was not found in ZIP."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project found: $PROJECT_DIR"
+
+      - name: Download Xray and build HEV native libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/26.3.11579264"
+          export PATH="$ANDROID_NDK_HOME:$PATH"
+
+          cd "$PROJECT_DIR"
+
+          if [ ! -f scripts/fetch-natives.sh ]; then
+            echo "ERROR: scripts/fetch-natives.sh is missing."
+            exit 1
+          fi
+
+          chmod +x scripts/fetch-natives.sh
+          bash scripts/fetch-natives.sh
+
+      - name: Verify native libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
+            LIB="app/src/main/jniLibs/$ABI/libhev-socks5-tunnel.so"
+
+            if [ ! -s "$LIB" ]; then
+              echo "ERROR: Missing HEV library for $ABI"
+              exit 1
+            fi
+
+            file "$LIB"
+            readelf -h "$LIB" >/dev/null
+            SIZE=$(stat -c%s "$LIB")
+
+            if [ "$SIZE" -lt 10000 ]; then
+              echo "ERROR: HEV library is suspiciously small: $LIB"
+              exit 1
+            fi
+
+            echo "Verified HEV library: $ABI ($SIZE bytes)"
+          done
+
+          find app/src/main/jniLibs -type f -name '*.so' -print
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon assembleDebug --stacktrace
+
+      - name: Verify APK contains native libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          APK="$(find app/build/outputs/apk \
+            -type f -name '*.apk' -print -quit)"
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK was not created."
+            exit 1
+          fi
+
+          unzip -l "$APK" > "$RUNNER_TEMP/apk-files.txt"
+
+          if ! grep -q 'lib/[^ ]*/libhev-socks5-tunnel.so' \
+            "$RUNNER_TEMP/apk-files.txt"; then
+            echo "ERROR: APK does not contain HEV TUN library."
+            exit 1
+          fi
+
+          echo "APK contains HEV TUN library."
+          echo "APK path: $APK"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: VEDA-VPN-APK
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 14
